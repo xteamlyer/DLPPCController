@@ -1,0 +1,145 @@
+name: DLPPC Controller Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dlppc-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Display .NET information
+        shell: pwsh
+        run: dotnet --info
+
+      - name: Locate project
+        id: project
+        shell: pwsh
+        run: |
+          $project = Get-ChildItem `
+            -Path $env:GITHUB_WORKSPACE `
+            -Filter "DLPPCController.csproj" `
+            -File `
+            -Recurse |
+            Where-Object {
+              $_.FullName -notmatch '[\\/](bin|obj)[\\/]'
+            } |
+            Select-Object -First 1
+
+          if (-not $project) {
+            throw "DLPPCController.csproj was not found!"
+          }
+
+          Write-Host "Project: $($project.FullName)"
+          "project_path=$($project.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore dependencies
+        shell: pwsh
+        run: |
+          dotnet restore "${{ steps.project.outputs.project_path }}"
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Publish standalone application
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:GITHUB_WORKSPACE "artifacts\publish"
+
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+
+          dotnet publish "${{ steps.project.outputs.project_path }}" `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --output "$output" `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:ContinuousIntegrationBuild=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $exe = Join-Path $output "DLPPCController.exe"
+
+          if (-not (Test-Path $exe)) {
+            throw "Published executable was not found!"
+          }
+
+          Write-Host "Successfully published: $exe"
+
+      - name: Package application
+        shell: pwsh
+        run: |
+          $publish = Join-Path $env:GITHUB_WORKSPACE "artifacts\publish"
+          $package = Join-Path $env:GITHUB_WORKSPACE "artifacts\DLPPCController-win-x64"
+
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+
+          Copy-Item `
+            (Join-Path $publish "DLPPCController.exe") `
+            $package
+
+          $exe = Join-Path $package "DLPPCController.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          "$hash  DLPPCController.exe" |
+            Out-File (Join-Path $package "SHA256SUMS.txt") -Encoding ascii
+
+          Compress-Archive `
+            -Path "$package\*" `
+            -DestinationPath "$env:GITHUB_WORKSPACE\artifacts\DLPPCController-win-x64.zip" `
+            -CompressionLevel Optimal `
+            -Force
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: DLPPCController-win-x64
+          path: |
+            artifacts/DLPPCController-win-x64.zip
+            artifacts/DLPPCController-win-x64/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build summary
+        if: success()
+        shell: pwsh
+        run: |
+          $exe = "artifacts\publish\DLPPCController.exe"
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+
+          @"
+          ## DLPPC Controller Build
+
+          - **Platform:** Windows x64
+          - **Framework:** .NET 10
+          - **Runtime:** Self-contained
+          - **Publish:** Single-file executable
+          - **Executable:** DLPPCController.exe
+          - **Size:** $size MB
+          - **Status:** Success
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8
